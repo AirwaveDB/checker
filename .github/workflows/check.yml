@@ -1,0 +1,44 @@
+name: Check streams
+
+on:
+  workflow_dispatch:
+    inputs:
+      country:
+        description: ISO country code; leave empty to check all countries
+        required: false
+        default: JP
+        type: string
+      limit:
+        description: Maximum streams to check; 0 means no limit
+        required: false
+        default: '0'
+        type: string
+      concurrency:
+        description: Concurrent checks
+        required: false
+        default: '20'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check streams
+        run: node scripts/check.mjs
+        env:
+          COUNTRY: ${{ inputs.country }}
+          LIMIT: ${{ inputs.limit }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airwavedb-stream-report
+          path: reports/*.json
+          if-no-files-found: error
