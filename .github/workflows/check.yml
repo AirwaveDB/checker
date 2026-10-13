@@ -24,6 +24,7 @@ on:
     branches: [main]
     paths:
       - 'scripts/check.mjs'
+      - 'scripts/merge.mjs'
       - '.github/workflows/check.yml'
 
 permissions:
@@ -81,6 +82,30 @@ jobs:
         with:
           name: airwavedb-stream-report-shard-${{ matrix.shard }}
           path: reports/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  summary:
+    if: github.event_name == 'schedule' && always()
+    needs: scheduled
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: airwavedb-stream-report-shard-*
+          path: reports
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Aggregate shard reports
+        run: node scripts/merge.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airwavedb-stream-summary
+          path: summary.json
           if-no-files-found: error
           retention-days: 14
 
