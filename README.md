@@ -34,10 +34,10 @@ Failure reasons currently include `http_error`, `empty_response`, `timeout`, `dn
 The workflow has three modes:
 
 - pushes that change the checker run a small JP smoke check;
-- the daily scheduled run checks the full dataset across eight deterministic parallel shards;
+- the daily scheduled run, after the database/streams/API update window, checks the full dataset across eight deterministic parallel shards and produces an aggregate `summary.json` artifact;
 - manual runs can target a country and set the limit and concurrency.
 
-Reports are uploaded as workflow artifacts instead of being committed because availability data is time-sensitive and would otherwise create noisy repository history.
+Shard reports and the aggregate summary are uploaded as workflow artifacts instead of being committed because availability data is time-sensitive and would otherwise create noisy repository history.
 
 ## Scope
 
