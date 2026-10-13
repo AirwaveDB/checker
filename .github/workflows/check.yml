@@ -18,12 +18,74 @@ on:
         required: false
         default: '20'
         type: string
+  schedule:
+    - cron: '43 3 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/check.mjs'
+      - '.github/workflows/check.yml'
 
 permissions:
   contents: read
 
+concurrency:
+  group: airwavedb-checker-${{ github.event_name }}
+  cancel-in-progress: true
+
 jobs:
-  check:
+  smoke:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Smoke check
+        run: node scripts/check.mjs
+        env:
+          COUNTRY: JP
+          LIMIT: '25'
+          CONCURRENCY: '10'
+          TIMEOUT_MS: '8000'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airwavedb-stream-report-smoke
+          path: reports/*.json
+          if-no-files-found: error
+          retention-days: 3
+
+  scheduled:
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check stream shard
+        run: node scripts/check.mjs
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: '8'
+          CONCURRENCY: '25'
+          TIMEOUT_MS: '10000'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airwavedb-stream-report-shard-${{ matrix.shard }}
+          path: reports/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  manual:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
@@ -37,8 +99,10 @@ jobs:
           COUNTRY: ${{ inputs.country }}
           LIMIT: ${{ inputs.limit }}
           CONCURRENCY: ${{ inputs.concurrency }}
+          TIMEOUT_MS: '10000'
       - uses: actions/upload-artifact@v4
         with:
-          name: airwavedb-stream-report
+          name: airwavedb-stream-report-manual
           path: reports/*.json
           if-no-files-found: error
+          retention-days: 14
