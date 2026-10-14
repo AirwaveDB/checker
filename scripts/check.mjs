@@ -6,11 +6,12 @@ import { fileURLToPath } from 'node:url';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const REPORTS = join(ROOT, 'reports');
 const RAW = 'https://raw.githubusercontent.com/AirwaveDB/streams/main/data';
-const USER_AGENT = 'AirwaveDB-checker/1.1 (+https://github.com/AirwaveDB/checker)';
+const USER_AGENT = 'AirwaveDB-checker/1.2 (+https://github.com/AirwaveDB/checker)';
 
 const COUNTRY = String(process.env.COUNTRY || '').trim().toUpperCase();
 const LIMIT = Math.max(0, Number(process.env.LIMIT || 0));
 const CONCURRENCY = Math.max(1, Math.min(50, Number(process.env.CONCURRENCY || 20)));
+const HOST_CONCURRENCY = Math.max(1, Math.min(10, Number(process.env.HOST_CONCURRENCY || 2)));
 const TIMEOUT_MS = Math.max(2000, Number(process.env.TIMEOUT_MS || 10000));
 const SHARD_COUNT = Math.max(1, Number(process.env.SHARD_COUNT || 1));
 const SHARD_INDEX = Math.max(0, Number(process.env.SHARD_INDEX || 0));
@@ -38,6 +39,16 @@ function shardFor(value, count) {
   return hash % count;
 }
 
+function shardKey(row) {
+  // Keep streams from the same host in the same scheduled shard so separate
+  // runners do not multiply connection pressure against one broadcaster/CDN.
+  try {
+    return new URL(row.url).hostname.toLowerCase();
+  } catch {
+    return row.id || row.url;
+  }
+}
+
 function classifyError(error) {
   if (error?.name === 'TimeoutError' || error?.name === 'AbortError') return 'timeout';
 
@@ -52,8 +63,38 @@ function classifyError(error) {
   return 'network_error';
 }
 
+const hostState = new Map();
+
+async function acquireHost(host) {
+  const state = hostState.get(host) || { active: 0, queue: [] };
+  hostState.set(host, state);
+  if (state.active < HOST_CONCURRENCY) {
+    state.active++;
+    return;
+  }
+  await new Promise((resolve) => state.queue.push(resolve));
+}
+
+function releaseHost(host) {
+  const state = hostState.get(host);
+  if (!state) return;
+  const next = state.queue.shift();
+  if (next) {
+    next();
+    return;
+  }
+  state.active--;
+  if (state.active === 0) hostState.delete(host);
+}
+
 async function check(row) {
   const started = Date.now();
+  let host = 'invalid-url';
+  try {
+    host = new URL(row.url).hostname.toLowerCase() || 'unknown-host';
+  } catch {}
+
+  await acquireHost(host);
   try {
     const res = await fetch(row.url, {
       method: 'GET',
@@ -106,6 +147,8 @@ async function check(row) {
       latencyMs: Date.now() - started,
       error: String(error?.cause?.message || error?.message || error),
     };
+  } finally {
+    releaseHost(host);
   }
 }
 
@@ -128,24 +171,38 @@ async function mapLimit(items, limit, fn) {
   return out;
 }
 
+function percentile(sorted, value) {
+  if (!sorted.length) return 0;
+  const index = Math.max(0, Math.ceil(value * sorted.length) - 1);
+  return sorted[index];
+}
+
 function summarize(results) {
   const reasons = {};
   const httpStatuses = {};
-  let latencyTotal = 0;
+  const successfulLatencies = [];
+  let attemptDurationTotal = 0;
 
   for (const result of results) {
     reasons[result.reason] = (reasons[result.reason] || 0) + 1;
     if (result.status) httpStatuses[result.status] = (httpStatuses[result.status] || 0) + 1;
-    latencyTotal += result.latencyMs;
+    attemptDurationTotal += result.latencyMs;
+    if (result.ok) successfulLatencies.push(result.latencyMs);
   }
 
-  const online = results.filter((x) => x.ok).length;
+  successfulLatencies.sort((a, b) => a - b);
+  const online = successfulLatencies.length;
+  const successfulLatencyTotal = successfulLatencies.reduce((sum, value) => sum + value, 0);
+
   return {
     checked: results.length,
     online,
     offline: results.length - online,
     onlineRate: results.length ? Number((online / results.length).toFixed(4)) : 0,
-    averageLatencyMs: results.length ? Math.round(latencyTotal / results.length) : 0,
+    averageLatencyMs: online ? Math.round(successfulLatencyTotal / online) : 0,
+    p50LatencyMs: percentile(successfulLatencies, 0.50),
+    p95LatencyMs: percentile(successfulLatencies, 0.95),
+    averageAttemptDurationMs: results.length ? Math.round(attemptDurationTotal / results.length) : 0,
     reasons,
     httpStatuses,
   };
@@ -153,7 +210,7 @@ function summarize(results) {
 
 async function main() {
   const index = await getJson(`${RAW}/index.json`);
-  const countries = COUNTRY ? [COUNTRY] : index.countries.map((x) => x.code);
+  const countries = COUNTRY ? [COUNTRY] : index.countries.map((item) => item.code);
 
   let rows = [];
   for (const code of countries) {
@@ -163,13 +220,13 @@ async function main() {
       rows.push(...streams);
     } catch (error) {
       if (COUNTRY) throw error;
-      process.stderr.write(`skip ${code}: ${error.message}\n`);
+      throw new Error(`Failed to load ${code}: ${error.message}`);
     }
   }
 
   const sourceCount = rows.length;
   if (SHARD_COUNT > 1) {
-    rows = rows.filter((row) => shardFor(row.id || row.url, SHARD_COUNT) === SHARD_INDEX);
+    rows = rows.filter((row) => shardFor(shardKey(row), SHARD_COUNT) === SHARD_INDEX);
   }
   if (LIMIT) rows = rows.slice(0, LIMIT);
 
@@ -177,14 +234,16 @@ async function main() {
     `checking ${rows.length}/${sourceCount} streams` +
       (COUNTRY ? ` country=${COUNTRY}` : '') +
       (SHARD_COUNT > 1 ? ` shard=${SHARD_INDEX + 1}/${SHARD_COUNT}` : '') +
-      ` concurrency=${CONCURRENCY} timeout=${TIMEOUT_MS}ms\n`,
+      ` concurrency=${CONCURRENCY} hostConcurrency=${HOST_CONCURRENCY} timeout=${TIMEOUT_MS}ms\n`,
   );
 
   const results = await mapLimit(rows, CONCURRENCY, check);
   const summary = summarize(results);
   const report = {
     generatedAt: new Date().toISOString(),
+    schemaVersion: 1,
     source: 'AirwaveDB/streams',
+    streamsGeneratedAt: index.generatedAt || null,
     country: COUNTRY || null,
     shard: SHARD_COUNT > 1 ? { index: SHARD_INDEX, count: SHARD_COUNT } : null,
     sourceCount,
